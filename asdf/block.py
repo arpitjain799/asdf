@@ -6,6 +6,7 @@ import re
 import struct
 import weakref
 from collections import namedtuple
+import types
 
 import numpy as np
 
@@ -61,7 +62,7 @@ class BlockManager:
         """
         return sum(len(x) for x in self._block_type_mapping.values())
 
-    def add(self, block):
+    def add(self, block, key=None):
         """
         Add an internal block to the manager.
         """
@@ -71,9 +72,9 @@ class BlockManager:
             # in the middle of the list.
             self.finish_reading_internal_blocks()
 
-        self._add(block)
+        self._add(block, key)
 
-    def _add(self, block):
+    def _add(self, block, key=None):
         block_set = self._block_type_mapping.get(block.array_storage, None)
         if block_set is not None:
             if block not in block_set:
@@ -86,7 +87,9 @@ class BlockManager:
             raise ValueError("Can not add second streaming block")
 
         if block._data is not None:
-            self._data_to_block_mapping[id(block._data)] = block
+            if key is None:
+                key = id(block._data)
+            self._data_to_block_mapping[hash(key)] = block
 
     def remove(self, block):
         """
@@ -97,8 +100,9 @@ class BlockManager:
             if block in block_set:
                 block_set.remove(block)
                 if block._data is not None:
-                    if id(block._data) in self._data_to_block_mapping:
-                        del self._data_to_block_mapping[id(block._data)]
+                    key = next((k for k, v in self._data_to_block_mapping.items() if v is block), None)
+                    if key is not None:
+                        del self._data_to_block_mapping[key]
         else:
             raise ValueError(
                 "Unknown array storage type {0}".format(block.array_storage))
@@ -736,7 +740,7 @@ class BlockManager:
 
         raise ValueError("block not found.")
 
-    def find_or_create_block_for_array(self, arr, ctx):
+    def find_or_create_block_for_array(self, arr, ctx, key=None):
         """
         For a given array, looks for an existing block containing its
         underlying data.  If not found, adds a new block to the block
@@ -758,13 +762,20 @@ class BlockManager:
             else:
                 arr._block = None
 
-        base = util.get_array_base(arr)
-        block = self._data_to_block_mapping.get(id(base))
+        if isinstance(arr, types.FunctionType):
+            base = arr
+        else:
+            base = util.get_array_base(arr)
+
+        if key is None:
+            key = id(base)
+
+        block = self._data_to_block_mapping.get(hash(key))
         if block is not None:
             return block
         block = Block(base)
-        self.add(block)
-        self._handle_global_block_settings(ctx, block)
+        self.add(block, key)
+#        self._handle_global_block_settings(ctx, block)
         return block
 
     def get_streamed_block(self):
@@ -1265,10 +1276,13 @@ class Block:
             finally:
                 self._fd.seek(curpos)
 
+        if isinstance(self._data, types.FunctionType):
+            return self._data()
+
         return self._data
 
     def close(self):
-        if self._memmapped and self._data is not None:
+        if self._memmapped and self._data is not None and not isinstance(self._data, types.FunctionType):
             if NUMPY_LT_1_7:  # pragma: no cover
                 try:
                     self._data.flush()
