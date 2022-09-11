@@ -409,7 +409,7 @@ class GenericFile(metaclass=util.InheritDocstrings):
         Returns `True` if the file supports random access (`seek` and
         `tell`).
         """
-        return False
+        return self._fd.seekable()
 
     def can_memmap(self):
         """
@@ -657,9 +657,6 @@ class RandomAccessFile(GenericFile):
     The base class of file types that support random access.
     """
 
-    def seekable(self):
-        return True
-
     def reader_until(
         self, delimiter, readahead_bytes, delimiter_name=None, include=True, initial_content=b"", exception=True
     ):
@@ -785,6 +782,9 @@ class InputStream(GenericFile):
         super(InputStream, self).__init__(fd, mode, close=close, uri=uri)
         self._fd = fd
         self._buffer = b""
+
+    def seekable(self):
+        return False
 
     def peek(self, size=-1):
         if size < 0:
