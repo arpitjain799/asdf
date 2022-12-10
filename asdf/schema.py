@@ -14,6 +14,7 @@ from jsonschema import validators as mvalidators
 from jsonschema.exceptions import RefResolutionError, ValidationError
 
 from . import constants, extension, generic_io, reference, tagged, treeutil, util, versioning, yamlutil
+from .deferred_block_source import DeferredBlockSource
 from .config import get_config
 from .exceptions import AsdfDeprecationWarning, AsdfWarning
 from .util import patched_urllib_parse
@@ -258,7 +259,7 @@ def _create_validator(validators=YAML_VALIDATORS, visit_repeat_nodes=False):
     type_checker = mvalidators.Draft4Validator.TYPE_CHECKER.redefine_many(
         {
             "array": lambda checker, instance: isinstance(instance, list) or isinstance(instance, tuple),
-            "integer": lambda checker, instance: not isinstance(instance, bool) and isinstance(instance, Integral),
+            "integer": lambda checker, instance: not isinstance(instance, bool) and isinstance(instance, Integral) or isinstance(instance, DeferredBlockSource),
             "string": lambda checker, instance: isinstance(instance, (str, np.str_)),
         }
     )

@@ -269,7 +269,7 @@ class ExtensionType:
         return node.__class__.__bases__[0](node)
 
     @classmethod
-    def to_tree_tagged(cls, node, ctx):
+    def to_tree_tagged(cls, node, ctx, serialization_context):
         """
         Converts instances of custom types into tagged objects.
 
@@ -291,7 +291,14 @@ class ExtensionType:
         -------
             An instance of `asdf.tagged.Tagged`.
         """
-        obj = cls.to_tree(node, ctx)
+        to_tree_arity = cls.to_tree.__code__.co_argcount
+        if to_tree_arity == 3:
+            obj = cls.to_tree(node, ctx)
+        elif to_tree_arity == 4:
+            obj = cls.to_tree(node, ctx, serialization_context)
+        else:
+            raise RuntimeError("Expected to_tree to accept 2 or 3 arguments")
+
         return tagged.tag_object(cls.yaml_tag, obj, ctx=ctx)
 
     @classmethod

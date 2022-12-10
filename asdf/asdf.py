@@ -16,6 +16,7 @@ from . import _version as version
 from . import block, constants, generic_io, reference, schema, treeutil, util, versioning, yamlutil
 from ._helpers import validate_version
 from .config import config_context, get_config
+from .deferred_block_source import DeferredBlockSource
 from .exceptions import AsdfConversionWarning, AsdfDeprecationWarning, AsdfWarning
 from .extension import (
     AsdfExtension,
@@ -132,6 +133,7 @@ class AsdfFile:
         self._plugin_extensions = self._process_plugin_extensions()
         self._extension_manager = None
         self._extension_list = None
+        self._serialization_context = None
 
         if custom_schema is not None:
             self._custom_schema = schema._load_schema_cached(custom_schema, self.resolver, True, False)
@@ -156,7 +158,7 @@ class AsdfFile:
         self._fd = None
         self._closed = False
         self._external_asdf_by_uri = {}
-        self._blocks = block.BlockManager(self, copy_arrays=copy_arrays, lazy_load=lazy_load, readonly=_readonly)
+        self._blocks = block.BlockManager(None, copy_arrays=copy_arrays, lazy_load=lazy_load, readonly=_readonly)
         self._uri = None
         if tree is None:
             # Bypassing the tree property here, to avoid validating
@@ -168,6 +170,7 @@ class AsdfFile:
                 # of copying the file?
                 raise ValueError("Can not copy AsdfFile and change active extensions")
             self._uri = tree.uri
+            self._blocks._uri = tree.uri
             # Set directly to self._tree (bypassing property), since
             # we can assume the other AsdfFile is already valid.
             self._tree = tree.tree
@@ -178,6 +181,7 @@ class AsdfFile:
             self.find_references()
         if uri is not None:
             self._uri = uri
+            self._blocks.uri = uri
 
         self._comments = []
 
@@ -401,7 +405,7 @@ class AsdfFile:
 
         return result
 
-    def _update_extension_history(self, serialization_context):
+    def _update_extension_history(self, output_tree, serialization_context):
         """
         Update the extension metadata on this file's tree to reflect
         extensions used during serialization.
@@ -414,20 +418,20 @@ class AsdfFile:
         if serialization_context.version < versioning.NEW_HISTORY_FORMAT_MIN_VERSION:
             return
 
-        if "history" not in self.tree:
-            self.tree["history"] = dict(extensions=[])
+        if "history" not in output_tree:
+            output_tree["history"] = dict(extensions=[])
         # Support clients who are still using the old history format
-        elif isinstance(self.tree["history"], list):
-            histlist = self.tree["history"]
-            self.tree["history"] = dict(entries=histlist, extensions=[])
+        elif isinstance(output_tree["history"], list):
+            histlist = output_tree["history"]
+            output_tree["history"] = dict(entries=histlist, extensions=[])
             warnings.warn(
                 "The ASDF history format has changed in order to "
                 "support metadata about extensions. History entries "
                 "should now be stored under tree['history']['entries'].",
                 AsdfWarning,
             )
-        elif "extensions" not in self.tree["history"]:
-            self.tree["history"]["extensions"] = []
+        elif "extensions" not in output_tree["history"]:
+            output_tree["history"]["extensions"] = []
 
         for extension in serialization_context._extensions_used:
             ext_name = extension.class_name
@@ -439,17 +443,17 @@ class AsdfFile:
             if extension.compressors:
                 ext_meta["supported_compression"] = [comp.label.decode("ascii") for comp in extension.compressors]
 
-            for i, entry in enumerate(self.tree["history"]["extensions"]):
+            for i, entry in enumerate(output_tree["history"]["extensions"]):
                 # Update metadata about this extension if it already exists
                 if (
                     entry.extension_uri is not None
                     and entry.extension_uri == extension.extension_uri
                     or entry.extension_class in extension.legacy_class_names
                 ):
-                    self.tree["history"]["extensions"][i] = ext_meta
+                    output_tree["history"]["extensions"][i] = ext_meta
                     break
             else:
-                self.tree["history"]["extensions"].append(ext_meta)
+                output_tree["history"]["extensions"].append(ext_meta)
 
     @property
     def file_format_version(self):
@@ -1035,7 +1039,7 @@ class AsdfFile:
             **kwargs,
         )
 
-    def _write_tree(self, tree, fd, pad_blocks):
+    def _write_tree(self, output_tree, fd, pad_blocks, serialization_context, output_block_manager):
         fd.write(constants.ASDF_MAGIC)
         fd.write(b" ")
         fd.write(self.version_map["FILE_FORMAT"].encode("ascii"))
@@ -1047,72 +1051,65 @@ class AsdfFile:
         fd.write(self.version_string.encode("ascii"))
         fd.write(b"\n")
 
-        if len(tree):
-            serialization_context = self._create_serialization_context()
-
-            compression_extensions = self.blocks.get_output_compression_extensions()
-            for ext in compression_extensions:
-                serialization_context._mark_extension_used(ext)
-
-            def _tree_finalizer(tagged_tree):
+        if len(output_tree):
+            def _tree_finalizer(tagged_output_tree):
                 """
                 The list of extensions used is not known until after
                 serialization, so we're using a hook provided by
                 yamlutil.dump_tree to update extension metadata
                 after the tree has been converted to tagged objects.
                 """
-                self._update_extension_history(serialization_context)
-                if "history" in self.tree:
-                    tagged_tree["history"] = yamlutil.custom_tree_to_tagged_tree(
-                        self.tree["history"], self, _serialization_context=serialization_context
+                output_block_manager.finalize(serialization_context._deferred_block_sources.values())
+
+                compression_extensions = output_block_manager.get_output_compression_extensions()
+                for ext in compression_extensions:
+                    serialization_context._mark_extension_used(ext)
+
+                self._update_extension_history(output_tree, serialization_context)
+                if "history" in output_tree:
+                    tagged_output_tree["history"] = yamlutil.custom_tree_to_tagged_tree(
+                        output_tree["history"], self, _serialization_context=serialization_context
                     )
                 else:
-                    tagged_tree.pop("history", None)
+                    tagged_output_tree.pop("history", None)
 
             yamlutil.dump_tree(
-                tree, fd, self, tree_finalizer=_tree_finalizer, _serialization_context=serialization_context
+                output_tree, fd, self, tree_finalizer=_tree_finalizer, _serialization_context=serialization_context
             )
 
         if pad_blocks:
             padding = util.calculate_padding(fd.tell(), pad_blocks, fd.block_size)
             fd.fast_forward(padding)
 
-    def _pre_write(self, fd, all_array_storage, all_array_compression, compression_kwargs=None):
-        if all_array_storage not in (None, "internal", "external", "inline"):
-            raise ValueError(f"Invalid value for all_array_storage: '{all_array_storage}'")
+    def _pre_write(self, output_tree):
+        if len(output_tree):
+            # TODO: Need to pass the output tree as an argument to the pre_write hook
+            # self.run_hook("pre_write")
+            pass
 
-        self._all_array_storage = all_array_storage
+        output_tree["asdf_library"] = get_asdf_library_info()
 
-        self._all_array_compression = all_array_compression
-        self._all_array_compression_kwargs = compression_kwargs
-
-        if len(self._tree):
-            self.run_hook("pre_write")
-
-        # This is where we'd do some more sophisticated block
-        # reorganization, if necessary
-        self._blocks.finalize(self)
-
-        self._tree["asdf_library"] = get_asdf_library_info()
-
-    def _serial_write(self, fd, pad_blocks, include_block_index):
-        self._write_tree(self._tree, fd, pad_blocks)
-        self.blocks.write_internal_blocks_serial(fd, pad_blocks)
-        self.blocks.write_external_blocks(fd.uri, pad_blocks)
+    def _serial_write(self, fd, output_tree, pad_blocks, include_block_index, output_block_manager, serialization_context):
+        self._write_tree(output_tree, fd, pad_blocks, serialization_context, output_block_manager)
+        output_block_manager.write_internal_blocks_serial(fd, pad_blocks)
+        output_block_manager.write_external_blocks(fd.uri, pad_blocks)
         if include_block_index:
-            self.blocks.write_block_index(fd, self)
+            output_block_manager.write_block_index(fd, serialization_context)
 
-    def _random_write(self, fd, pad_blocks, include_block_index):
-        self._write_tree(self._tree, fd, False)
+    def _random_write(self, fd, pad_blocks, include_block_index, storage_override, compression_override, compression_override_kwargs):
+        self._write_tree(self._tree, fd, False, storage_override, compression_override, compression_override_kwargs)
         self.blocks.write_internal_blocks_random_access(fd)
         self.blocks.write_external_blocks(fd.uri, pad_blocks)
         if include_block_index:
             self.blocks.write_block_index(fd, self)
         fd.truncate()
 
-    def _post_write(self, fd):
+    def _post_write(self, fd, output_tree):
         if len(self._tree):
-            self.run_hook("post_write")
+            # TODO: Need to pass the output tree as an argument to post_write
+            # Is this ever useful?
+            # self.run_hook("post_write")
+            pass
 
     def update(
         self,
@@ -1339,22 +1336,29 @@ class AsdfFile:
         with config_context() as config:
             _handle_deprecated_kwargs(config, kwargs)
 
-            if version is not None:
-                self.version = version
+            if version is None:
+                version = get_config().default_version
 
             with generic_io.get_file(fd, mode="w") as fd:
-                # TODO: This is not ideal: we really should pass the URI through
-                # explicitly to wherever it is required instead of making it an
-                # attribute of the AsdfFile.
-                if self._uri is None:
-                    self._uri = fd.uri
-                self._pre_write(fd, all_array_storage, all_array_compression, compression_kwargs=compression_kwargs)
+                output_block_manager = block.BlockManager(fd.uri, readonly=False)
+
+                serialization_context = self._create_serialization_context(
+                    storage_override=all_array_storage,
+                    compression_override=all_array_compression,
+                    compression_override_kwargs=compression_kwargs,
+                    uri=fd.uri,
+                    version=version,
+                )
+
+                output_tree = AsdfObject(self._tree)
+
+                self._pre_write(output_tree)
 
                 try:
-                    self._serial_write(fd, pad_blocks, include_block_index)
+                    self._serial_write(fd, output_tree, pad_blocks, include_block_index, output_block_manager, serialization_context)
                     fd.flush()
                 finally:
-                    self._post_write(fd)
+                    self._post_write(fd, output_tree)
 
     def find_references(self):
         """
@@ -1677,8 +1681,19 @@ class AsdfFile:
 
     # This function is called from within yamlutil methods to create
     # a context when one isn't explicitly passed in.
-    def _create_serialization_context(self):
-        return SerializationContext(self.version_string, self.extension_manager, self.uri)
+    def _create_serialization_context(self, storage_override=None, compression_override=None, compression_override_kwargs=None, version=None, uri=None):
+        if version is None:
+            version = self.version
+
+        return SerializationContext(
+            str(version),
+            self.extension_manager,
+            uri,
+            self.blocks,
+            storage_override,
+            compression_override,
+            compression_override_kwargs
+        )
 
 
 def _check_and_set_mode(fileobj, asdf_mode):
@@ -1850,12 +1865,18 @@ class SerializationContext:
     Container for parameters of the current (de)serialization.
     """
 
-    def __init__(self, version, extension_manager, url):
+    def __init__(self, version, extension_manager, url, source_block_manager, storage_override, compression_override, compression_override_kwargs):
         self._version = validate_version(version)
         self._extension_manager = extension_manager
         self._url = url
+        self._storage_override = storage_override
+        self._compression_override = compression_override
+        self._compression_override_kwargs = compression_override_kwargs
+
+        self._source_block_manager = source_block_manager
 
         self.__extensions_used = set()
+        self.__deferred_block_sources = {}
 
     @property
     def url(self):
@@ -1894,6 +1915,47 @@ class SerializationContext:
         """
         return self._extension_manager
 
+    def reserve_block(self, key, data_callback, storage=None, compression=None, compression_kwargs=None, data_size=None):
+        if key in self.__deferred_block_sources:
+            return self.__deferred_block_sources[key]
+        else:
+            storage = self._resolve_storage(key, storage)
+            compression, compression_kwargs = self._resolve_compression(key, compression, compression_kwargs)
+            source = DeferredBlockSource(key, data_callback, storage, compression, compression_kwargs, data_size=data_size)
+            self.__deferred_block_sources[key] = source
+            return source
+
+    def _resolve_storage(self, key, storage):
+        # The global override takes precedence
+        if self._storage_override is not None:
+            return self._storage_override
+
+        # Then, if the converter specified a storage type, use that
+        if storage is not None:
+            return storage
+
+        # If this is a block read from an existing file, keep its
+        # original storage type
+        blk = self._source_block_manager._data_to_block_mapping.get(key)
+        if blk is not None and blk.array_storage is not None:
+            return blk.array_storage
+
+        # Fallback is internal
+        return "internal"
+
+    def _resolve_compression(self, key, compression, compression_kwargs):
+        if self._compression_override is not None:
+            return self._compression_override, self._compression_override_kwargs
+
+        if compression is not None:
+            return compression, compression_kwargs
+
+        blk = self._source_block_manager._data_to_block_mapping.get(key)
+        if blk is not None and blk.output_compression is not None:
+            return blk.output_compression, blk.output_compression_kwargs
+
+        return None, None
+
     def _mark_extension_used(self, extension):
         """
         Note that an extension was used when reading or writing the file.
@@ -1914,3 +1976,7 @@ class SerializationContext:
         set of asdf.extension.AsdfExtension or asdf.extension.Extension
         """
         return self.__extensions_used
+
+    @property
+    def _deferred_block_sources(self):
+        return self.__deferred_block_sources

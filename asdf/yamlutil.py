@@ -7,6 +7,7 @@ import yaml
 
 from . import schema, tagged, treeutil, util
 from .constants import STSCI_SCHEMA_TAG_BASE, YAML_TAG_PREFIX
+from .deferred_block_source import DeferredBlockSource
 from .exceptions import AsdfConversionWarning
 from .tags.core import AsdfObject
 from .versioning import split_tag_version
@@ -140,6 +141,13 @@ AsdfDumper.add_representer(np.str_, represent_numpy_str)
 AsdfDumper.add_representer(np.bytes_, AsdfDumper.represent_binary)
 
 
+def represent_deferred_block_source(dumper, data):
+    return dumper.represent_data(data.source)
+
+
+AsdfDumper.add_representer(DeferredBlockSource, represent_deferred_block_source)
+
+
 class AsdfLoader(_yaml_base_loader):
     """
     A specialized YAML loader that can construct "tagged basic Python
@@ -255,7 +263,14 @@ def custom_tree_to_tagged_tree(tree, ctx, _serialization_context=None):
             )
 
             if tag is not None:
-                return tag.to_tree_tagged(obj, ctx)
+                to_tree_tagged_arity = tag.to_tree_tagged.__code__.co_argcount
+                if to_tree_tagged_arity == 3:
+                    return tag.to_tree_tagged(obj, ctx)
+                elif to_tree_tagged_arity == 4:
+                    return tag.to_tree_tagged(obj, ctx, _serialization_context)
+                else:
+                    raise RuntimeError("Expected to_tree_tagged to accept 2 or 3 arguments")
+
             return obj
 
     return treeutil.walk_and_modify(

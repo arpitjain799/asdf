@@ -5,8 +5,11 @@ import numpy as np
 from jsonschema import ValidationError
 from numpy import ma
 
+from asdf.config import get_config
+
 from ... import util
 from ...types import AsdfType
+
 
 _datatype_names = {
     "int8": "i1",
@@ -407,16 +410,7 @@ class NDArrayType(AsdfType):
         raise TypeError("Invalid ndarray description.")
 
     @classmethod
-    def reserve_blocks(cls, data, ctx):
-        # Find all of the used data buffers so we can add or rearrange
-        # them if necessary
-        if isinstance(data, np.ndarray):
-            yield ctx.blocks.find_or_create_block_for_array(data, ctx)
-        elif isinstance(data, NDArrayType):
-            yield data.block
-
-    @classmethod
-    def to_tree(cls, data, ctx):
+    def to_tree(cls, data, ctx, serialization_context):
         # The ndarray-1.0.0 schema does not permit 0 valued strides.
         # Perhaps we'll want to allow this someday, to efficiently
         # represent an array of all the same value.
@@ -433,18 +427,30 @@ class NDArrayType(AsdfType):
 
         shape = data.shape
 
-        block = ctx.blocks.find_or_create_block_for_array(data, ctx)
+        storage = None
+        if isinstance(base, NDArrayType) and base.block is not None and base.storage not in ["inline", "internal"]:
+            storage = base.block.array_storage
+        else:
+            threshold = get_config().array_inline_threshold
+            if threshold is not None:
+                if np.product(shape) < threshold:
+                    storage = "inline"
+                else:
+                    storage = "internal"
 
-        if block.array_storage == "fits":
+        source = serialization_context.reserve_block(id(base), lambda: base, storage=storage, data_size=base.nbytes)
+
+        # TODO: How does this get set to "fits" now?
+        if source.storage == "fits":
             # Views over arrays stored in FITS files have some idiosyncracies.
             # astropy.io.fits always writes arrays C-contiguous with big-endian
             # byte order, whereas asdf preserves the "contiguousity" and byte order
             # of the base array.
             if (
-                block.data.shape != data.shape
-                or block.data.dtype != data.dtype
-                or block.data.ctypes.data != data.ctypes.data
-                or block.data.strides != data.strides
+                base.data.shape != data.shape
+                or base.data.dtype != data.dtype
+                or base.data.ctypes.data != data.ctypes.data
+                or base.data.strides != data.strides
             ):
                 raise ValueError(
                     "ASDF has only limited support for serializing views over arrays stored "
@@ -457,7 +463,7 @@ class NDArrayType(AsdfType):
             strides = None
             dtype, byteorder = numpy_dtype_to_asdf_datatype(
                 data.dtype,
-                include_byteorder=(block.array_storage != "inline"),
+                include_byteorder=(source.storage != "inline"),
                 override_byteorder="big",
             )
         else:
@@ -472,25 +478,25 @@ class NDArrayType(AsdfType):
 
             dtype, byteorder = numpy_dtype_to_asdf_datatype(
                 data.dtype,
-                include_byteorder=(block.array_storage != "inline"),
+                include_byteorder=(source.storage != "inline"),
             )
 
         result = {}
 
         result["shape"] = list(shape)
-        if block.array_storage == "streamed":
+        if source.storage == "streamed":
             result["shape"][0] = "*"
 
-        if block.array_storage == "inline":
+        if source.storage == "inline":
             listdata = numpy_array_to_list(data)
             result["data"] = listdata
             result["datatype"] = dtype
         else:
             result["shape"] = list(shape)
-            if block.array_storage == "streamed":
+            if source.storage == "streamed":
                 result["shape"][0] = "*"
 
-            result["source"] = ctx.blocks.get_source(block)
+            result["source"] = source
             result["datatype"] = dtype
             result["byteorder"] = byteorder
 
@@ -502,8 +508,9 @@ class NDArrayType(AsdfType):
 
         if isinstance(data, ma.MaskedArray):
             if np.any(data.mask):
-                if block.array_storage == "inline":
-                    ctx.blocks.set_array_storage(ctx.blocks[data.mask], "inline")
+                if source.storage == "inline":
+                    mask_base = util.get_array_base(data.mask)
+                    serialization_context.reserve_block(id(mask_base), lambda: mask_base, storage="inline")
                 result["mask"] = data.mask
 
         return result

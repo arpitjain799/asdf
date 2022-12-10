@@ -21,8 +21,8 @@ class BlockManager:
     Manages the `Block`s associated with a ASDF file.
     """
 
-    def __init__(self, asdffile, copy_arrays=False, lazy_load=True, readonly=False):
-        self._asdffile = weakref.ref(asdffile)
+    def __init__(self, uri, copy_arrays=False, lazy_load=True, readonly=False):
+        self._uri = uri
 
         self._internal_blocks = []
         self._external_blocks = []
@@ -550,55 +550,6 @@ class BlockManager:
         parts[2] = path
         return patched_urllib_parse.urlunparse(parts)
 
-    def _find_used_blocks(self, tree, ctx):
-        reserved_blocks = set()
-
-        for node in treeutil.iter_tree(tree):
-            hook = ctx.type_index.get_hook_for_type("reserve_blocks", type(node), ctx.version_string)
-            if hook is not None:
-                for block in hook(node, ctx):
-                    reserved_blocks.add(block)
-
-        for block in list(self.blocks):
-            if getattr(block, "_used", 0) == 0 and block not in reserved_blocks:
-                self.remove(block)
-
-    def _handle_global_block_settings(self, ctx, block):
-        all_array_storage = getattr(ctx, "_all_array_storage", None)
-        if all_array_storage:
-            self.set_array_storage(block, all_array_storage)
-
-        all_array_compression = getattr(ctx, "_all_array_compression", "input")
-        all_array_compression_kwargs = getattr(ctx, "_all_array_compression_kwargs", {})
-        # Only override block compression algorithm if it wasn't explicitly set
-        # by AsdfFile.set_array_compression.
-        if all_array_compression != "input":
-            block.output_compression = all_array_compression
-            block.output_compression_kwargs = all_array_compression_kwargs
-
-        if all_array_storage is None:
-            threshold = get_config().array_inline_threshold
-            if threshold is not None and block.array_storage in ["internal", "inline"]:
-                if np.product(block.data.shape) < threshold:
-                    self.set_array_storage(block, "inline")
-                else:
-                    self.set_array_storage(block, "internal")
-
-    def finalize(self, ctx):
-        """
-        At this point, we have a complete set of blocks for the file,
-        with no extras.
-
-        Here, they are reindexed, and possibly reorganized.
-        """
-        # TODO: Should this reset the state (what's external and what
-        # isn't) afterword?
-
-        self._find_used_blocks(ctx.tree, ctx)
-
-        for block in list(self.blocks):
-            self._handle_global_block_settings(ctx, block)
-
     def get_block(self, source):
         """
         Given a "source identifier", return a block.
@@ -659,7 +610,8 @@ class BlockManager:
             raise ValueError(f"Block '{source}' not found.")
 
         elif isinstance(source, str):
-            asdffile = self._asdffile().open_external(source)
+            raise NotImplementedError("Ed broke reading external blocks")
+            # asdffile = self._asdffile().open_external(source)
             block = asdffile.blocks._internal_blocks[0]
             self.set_array_storage(block, "external")
 
@@ -694,46 +646,42 @@ class BlockManager:
 
         for i, external_block in enumerate(self.external_blocks):
             if block == external_block:
-                if self._asdffile().uri is None:
+                if self._uri is None:
                     raise ValueError("Can't write external blocks, since URI of main file is unknown.")
 
-                parts = list(patched_urllib_parse.urlparse(self._asdffile().uri))
+                parts = list(patched_urllib_parse.urlparse(self._uri))
                 path = parts[2]
                 filename = os.path.basename(path)
                 return self.get_external_filename(filename, i)
 
         raise ValueError("block not found.")
 
-    def find_or_create_block_for_array(self, arr, ctx):
-        """
-        For a given array, looks for an existing block containing its
-        underlying data.  If not found, adds a new block to the block
-        list.  Returns the index in the block list to the array.
+    def finalize(self, deferred_block_sources):
+        keys = {s.key for s in deferred_block_sources}
 
-        Parameters
-        ----------
-        arr : numpy.ndarray
+        remove_blocks = []
+        for key, block in self._data_to_block_mapping:
+            if key not in keys:
+                remove_blocks.add(block)
 
-        Returns
-        -------
-        block : Block
-        """
-        from .tags.core import ndarray
+        for block in remove_blocks:
+            self.remove(block)
 
-        if isinstance(arr, ndarray.NDArrayType) and arr.block is not None:
-            if arr.block in self.blocks:
-                return arr.block
-            else:
-                arr._block = None
+        for deferred_block_source in deferred_block_sources:
+            block = self._data_to_block_mapping.get(deferred_block_source.key)
+            if block is None:
+                block = Block(None)
+                self.add(block)
 
-        base = util.get_array_base(arr)
-        block = self._data_to_block_mapping.get(id(base))
-        if block is not None:
-            return block
-        block = Block(base)
-        self.add(block)
-        self._handle_global_block_settings(ctx, block)
-        return block
+            block._data_callback = deferred_block_source.data_callback
+            block._data_size = deferred_block_source.data_size
+            block.output_compression = deferred_block_source.compression
+            block.output_compression_kwargs = deferred_block_source.compression_kwargs
+
+            self.set_array_storage(block, deferred_block_source.storage)
+
+            if deferred_block_source.storage != "inline":
+                deferred_block_source._source = self.get_source(block)
 
     def get_streamed_block(self):
         """
@@ -774,9 +722,6 @@ class BlockManager:
                 ext += [compressor[1]]  # second item is the extension
         return ext
 
-    def __getitem__(self, arr):
-        return self.find_or_create_block_for_array(arr, object())
-
     def close(self):
         for block in self.blocks:
             block.close()
@@ -800,8 +745,9 @@ class Block:
         ]
     )
 
-    def __init__(self, data=None, uri=None, array_storage="internal", memmap=True, lazy_load=True):
+    def __init__(self, data=None, uri=None, array_storage="internal", memmap=True, lazy_load=True, data_callback=None):
         self._data = data
+        self._data_callback = data_callback
         self._uri = uri
         self._array_storage = array_storage
 
@@ -966,7 +912,7 @@ class Block:
         compression steps to run.  It should only be called when
         updating the file in-place, otherwise the work is redundant.
         """
-        if self._data is not None:
+        if self._data is not None or self._data_callback is not None:
             data = self._flattened_data
             self._data_size = data.nbytes
 
@@ -1139,7 +1085,7 @@ class Block:
         """
         self._header_size = self._header.size
 
-        if self._data is not None:
+        if self._data is not None or self._data_callback is not None:
             data = self._flattened_data
         else:
             data = None
@@ -1206,6 +1152,12 @@ class Block:
         """
         Get the data for the block, as a numpy array.
         """
+        if self._data_callback is not None:
+            self._data = self._data_callback()
+            self._data_callback = None
+            self.update_size()
+            self._allocated = self._size
+
         if self._data is None:
             if self._fd.is_closed():
                 raise OSError("ASDF file has already been closed. " "Can not get the data.")
